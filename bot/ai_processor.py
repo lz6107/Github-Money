@@ -89,42 +89,76 @@ async def generate_text(release: dict) -> str:
         return _fallback(release)
 
 
-async def generate_image(repo: str) -> bytes | None:
+def _image_prompts(category: str) -> list[str]:
+    """
+    返回两个 prompt：主 prompt 先试，失败后用保底 prompt 重试。
+    完全不包含项目名，避免 OpenAI 内容审核误判。
+    """
+    category_hints = {
+        "AI工具":   "a brain connected to a circuit board, representing AI and machine learning",
+        "自动化":   "interconnected gears and arrows forming a loop, representing workflow automation",
+        "开源SaaS": "a cloud shape with building blocks inside, representing a SaaS platform",
+    }
+    hint = category_hints.get(category, "a computer screen with abstract data flowing through it")
+
+    primary = (
+        f"Minimal flat line-art icon: {hint}. "
+        "Pure white background, single thin black outlines only, geometric shapes, "
+        "no text, no color fills, no gradients, no shadows, no realistic details. "
+        "Style: Material Design outlined icon."
+    )
+    fallback = (
+        "Minimal flat line-art icon of a geometric cube with a small lightning bolt, "
+        "representing software technology. White background, black outlines only, no text, no color."
+    )
+    return [primary, fallback]
+
+
+async def _dalle_request(client: httpx.AsyncClient, prompt: str) -> str | None:
+    """向 DALL-E 3 发一次请求，返回图片 URL 或 None"""
+    r = await client.post(
+        "https://api.openai.com/v1/images/generations",
+        headers={
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model":           IMAGE_MODEL,
+            "prompt":          prompt,
+            "n":               1,
+            "size":            IMAGE_SIZE,
+            "response_format": "url",
+        },
+    )
+    if r.status_code != 200:
+        # 打印完整错误，方便排查
+        logger.error(f"DALL-E 返回 {r.status_code}，错误详情: {r.text}")
+        return None
+    data = r.json()
+    return data["data"][0]["url"]
+
+
+async def generate_image(repo: str, category: str = "") -> bytes | None:
     """DALL-E 3 极简线条图，返回 PNG bytes；失败返回 None"""
     if not OPENAI_API_KEY:
         return None
 
-    short_name = repo.split("/")[-1]
-    prompt = (
-        f"Minimal flat line-art tech icon representing a software tool called '{short_name}'. "
-        "Pure white background. Single thin black stroke outlines only. "
-        "Geometric and symbolic shapes — no text, no color fills, no gradients, no shadows, no photorealism. "
-        "Think: clean app icon in the style of Material Design outlined symbols."
-    )
+    prompts = _image_prompts(category)
 
     try:
-        # Step 1: 请求 DALL-E 生成，拿到临时 URL
         async with httpx.AsyncClient(timeout=90) as gen_client:
-            r = await gen_client.post(
-                "https://api.openai.com/v1/images/generations",
-                headers={
-                    "Authorization": f"Bearer {OPENAI_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model":           IMAGE_MODEL,
-                    "prompt":          prompt,
-                    "n":               1,
-                    "size":            IMAGE_SIZE,
-                    "response_format": "url",
-                },
-            )
-            r.raise_for_status()
-            data    = r.json()
-            img_url = data["data"][0]["url"]
-            logger.info(f"🎨 DALL-E 图片生成成功，开始下载...")
+            img_url = None
+            for i, prompt in enumerate(prompts):
+                logger.info(f"🎨 DALL-E 生成图片（尝试 {i+1}/{len(prompts)}）...")
+                img_url = await _dalle_request(gen_client, prompt)
+                if img_url:
+                    break
+                logger.warning(f"第 {i+1} 次尝试失败，{'重试中...' if i+1 < len(prompts) else '放弃'}")
 
-        # Step 2: 用独立 client 立刻下载（URL 有效期约1小时，但越快越好）
+            if not img_url:
+                return None
+
+        # 用独立 client 下载图片
         async with httpx.AsyncClient(timeout=60) as dl_client:
             img_r = await dl_client.get(img_url)
             img_r.raise_for_status()

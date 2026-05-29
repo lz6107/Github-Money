@@ -26,9 +26,10 @@ class TelegramPublisher:
         logger.info(f"⏳ 生成文案和图片: {repo}")
 
         # 并发生成文案 + 图片
+        category = release.get("category", "")
         text, image_bytes = await asyncio.gather(
             generate_text(release),
-            generate_image(repo),
+            generate_image(repo, category),
         )
 
         if image_bytes:
